@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.env.*
+
+# Data / scratch
+*.db
+*.sqlite
+*.sqlite3
+/scratch/
+/tmp/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*~
+
+# Agent / editor configs
+.agents/
+.claude/
+.cursor/
+AGENTS.md
+*.log
