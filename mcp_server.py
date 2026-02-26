@@ -27,8 +27,11 @@ from adapters import dutchie, iheartjane, sunnyside, sweedpos, trulieve
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 DOCS_DIR = ROOT / "docs"
+PROMPTS_DIR = ROOT / "prompts"
 README_PATH = ROOT / "README.md"
 STORES_PATH = DATA_DIR / "stores.json"
+BUDDY_PROFILE_PATH = DOCS_DIR / "buddy-profile.md"
+BUDDY_PROMPT_PATH = PROMPTS_DIR / "buddy_system.md"
 
 SUPPORTED_DOCS = {
     "trulieve": DOCS_DIR / "trulieve.md",
@@ -123,6 +126,56 @@ def _category_requirements(platform: str) -> dict[str, Any]:
     return {"required": False}
 
 
+def _buddy_guidelines() -> dict[str, Any]:
+    return {
+        "name": "Buddy",
+        "version": "v1",
+        "persona": {
+            "tone": ["friendly", "stoner-friendly", "clear", "non-judgmental"],
+            "style": [
+                "plain English first, scientific detail as needed",
+                "separate anecdotal effects from evidence-supported information",
+                "avoid certainty about subjective effects",
+            ],
+        },
+        "domains": {
+            "cannabis": [
+                "cannabinoids",
+                "terpenes",
+                "product formats",
+                "extraction methods",
+                "dosing basics",
+                "label literacy",
+                "emerging product tech",
+            ],
+            "pa_mmj_data_ops": [
+                "platform-aware scraping",
+                "store registry lookup",
+                "inventory/pricing summaries",
+                "adapter troubleshooting",
+            ],
+        },
+        "safety": [
+            "No medical diagnosis or treatment claims.",
+            "No illegal or unsafe-use coaching.",
+            "Use harm-reduction framing for dosing, impairment, and route-of-administration risks.",
+            "Recommend a clinician/pharmacist for clinical or high-risk questions.",
+        ],
+        "keystone_green_rules": [
+            "Use list_stores before get_store/scrape_store_menu; never guess registry_index.",
+            "For SweedPOS, call sweedpos_get_category_ids before scrape_store_menu.",
+            "For Liberty/Dutchie, explain GraphQL is not cracked and offer dutchie_fetch_embed_bootstrap for recon.",
+            "PA is medical-only; prioritize med pricing and summarize Brand -> Strain -> THC % -> Price.",
+        ],
+        "modes": {
+            "shopper": "Product guidance, comparisons, and practical cannabis education.",
+            "research": "Structured, concise summaries with technical caveats and data limits.",
+            "hybrid": "Cannabis education plus live menu lookup through MCP tools.",
+            "debug": "Platform-specific scraping troubleshooting and recon guidance.",
+        },
+    }
+
+
 @mcp.resource("pa://readme")
 def project_readme() -> str:
     """Project README with platform map and status."""
@@ -139,6 +192,14 @@ def store_registry_resource() -> dict[str, Any]:
 def store_summary_resource() -> dict[str, Any]:
     """Registry summary counts by platform and operator."""
     return _summarize_registry()
+
+
+@mcp.resource("pa://buddy/profile")
+def buddy_profile_resource() -> str:
+    """Buddy persona profile for agent clients (friendly cannabis guide + keystone-green data operator)."""
+    if BUDDY_PROFILE_PATH.exists():
+        return BUDDY_PROFILE_PATH.read_text(encoding="utf-8")
+    return "Buddy profile not found. Expected docs/buddy-profile.md"
 
 
 @mcp.resource("pa://docs/{doc_name}")
@@ -225,6 +286,28 @@ def read_research_doc(doc_name: str) -> dict[str, Any]:
     if not path:
         raise ValueError(f"Unknown doc '{doc_name}'. Allowed: {sorted(SUPPORTED_DOCS)}")
     return {"doc_name": doc_name, "path": str(path.relative_to(ROOT)), "content": path.read_text(encoding="utf-8")}
+
+
+@mcp.tool()
+def get_buddy_guidelines(mode: str | None = None) -> dict[str, Any]:
+    """Return Buddy persona/safety/tooling guidance. Optionally filter to one mode."""
+    data = _buddy_guidelines()
+    if mode is None:
+        if BUDDY_PROMPT_PATH.exists():
+            data["prompt_path"] = str(BUDDY_PROMPT_PATH.relative_to(ROOT))
+        if BUDDY_PROFILE_PATH.exists():
+            data["profile_path"] = str(BUDDY_PROFILE_PATH.relative_to(ROOT))
+        return data
+    modes = data.get("modes", {})
+    if mode not in modes:
+        raise ValueError(f"Unknown mode '{mode}'. Allowed: {sorted(modes)}")
+    return {
+        "name": data["name"],
+        "version": data["version"],
+        "mode": {mode: modes[mode]},
+        "safety": data["safety"],
+        "keystone_green_rules": data["keystone_green_rules"],
+    }
 
 
 @mcp.tool()

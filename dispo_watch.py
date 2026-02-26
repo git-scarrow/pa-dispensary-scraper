@@ -11,12 +11,20 @@ Usage:
     python dispo_watch.py --scrape   # scrape only (no digest)
     python dispo_watch.py --list     # list stores that match current config
 
-Config: watch_config.json (see example below)
+Config: watch_config.json
 
 Filter modes:
   radius  — scrape stores within N miles of a zip code
   stores  — scrape an explicit list by registry_index
   all     — scrape every supported store (default if no config)
+
+Hunter Mode (Phase 2.5):
+  - Define 'notifications' in config to highlight "Unicorn" strains.
+  - Use 'aliases' to catch spelling variants (e.g. "LA Baker" vs "L.A. Baker").
+  - Filter out house brands with 'ignore_brands'.
+  - Toggle 'show_unicorn_summary' to hide/show unicorn rollups.
+  - Toggle 'show_ignored_summary' to see what was filtered.
+  - Add 'terp_thresholds' to filter for medicinal quality (e.g. total terps / terp ratio).
 
 Systemd user timer: install dispo_watch.service + dispo_watch.timer
   cp dispo_watch.{service,timer} ~/.config/systemd/user/
@@ -30,6 +38,7 @@ import argparse
 import json
 import logging
 import math
+import re
 import time
 import traceback
 from datetime import datetime, timezone
@@ -40,6 +49,7 @@ import sqlite_utils
 from rich.console import Console
 from rich.table import Table
 from rich import box
+from rich.text import Text
 
 from adapters import iheartjane, sunnyside, sweedpos, trulieve
 
@@ -60,7 +70,19 @@ console = Console()
 # Config + store filtering
 # ---------------------------------------------------------------------------
 
-DEFAULT_CONFIG: dict[str, Any] = {"filter": {"mode": "all"}}
+DEFAULT_CONFIG: dict[str, Any] = {
+    "filter": {"mode": "all"},
+    "notifications": {
+        "unicorns": [],
+        "aliases": {},
+        "ignore_brands": [],
+        "iheartjane_text_fallback": False,
+        "match_mode": "contains",
+        "show_unicorn_summary": True,
+        "show_ignored_summary": False,
+        "terp_thresholds": {},
+    },
+}
 
 EXAMPLE_CONFIG = """\
 {
@@ -69,6 +91,22 @@ EXAMPLE_CONFIG = """\
     "mode": "radius",
     "center_zip": "19002",
     "radius_miles": 30
+  },
+  "notifications": {
+    "unicorns": ["Golden Pineapple", "LA Baker", "African Thai", "Bio Jesus"],
+    "aliases": {
+      "LA Baker": ["L.A. Baker"],
+      "African Thai": ["African Thai #15"]
+    },
+    "ignore_brands": ["The Bank", "Seche", "Whole Plants", "Kind Tree"],
+    "iheartjane_text_fallback": false,
+    "match_mode": "contains",
+    "show_unicorn_summary": true,
+    "show_ignored_summary": true,
+    "terp_thresholds": {
+      "terp_total": 1.5,
+      "terp_ratio": 0.08
+    }
   }
 }
 
@@ -206,8 +244,350 @@ def filter_stores(
 # Schema normalization  (one dict per product row)
 # ---------------------------------------------------------------------------
 
-def _normalize_iheartjane(product: dict, idx: int, store: dict) -> dict:
-    return {
+PA_BIG_8_TERPENES = (
+    "myrcene",
+    "caryophyllene",
+    "limonene",
+    "terpinolene",
+    "linalool",
+    "pinene",
+    "humulene",
+    "ocimene",
+)
+
+TERP_DISPLAY_NAMES = {
+    "myrcene": "myrcene",
+    "caryophyllene": "caryophyllene",
+    "limonene": "limonene",
+    "terpinolene": "terpinolene",
+    "linalool": "linalool",
+    "pinene": "pinene",
+    "humulene": "humulene",
+    "ocimene": "ocimene",
+}
+
+
+def _coerce_percent_scalar(value: Any) -> float | None:
+    """Best-effort parse for terp/cannabinoid percent-like values."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip().replace("%", "")
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    if isinstance(value, list):
+        for item in value:
+            parsed = _coerce_percent_scalar(item)
+            if parsed is not None:
+                return parsed
+        return None
+    if isinstance(value, dict):
+        unit = value.get("unitAbbr")
+        if unit and str(unit).strip() != "%":
+            return None
+        if "percent" in value:
+            return _coerce_percent_scalar(value.get("percent"))
+        if "displayValue" in value:
+            return _coerce_percent_scalar(value.get("displayValue"))
+        if "value" in value:
+            return _coerce_percent_scalar(value.get("value"))
+        return None
+    return None
+
+
+def _normalize_terp_key(key: Any) -> str:
+    text = str(key or "").strip().casefold()
+    if not text:
+        return ""
+    chars = []
+    for ch in text:
+        chars.append(ch if (ch.isalnum() or ch == "_") else "_")
+    norm = "".join(chars).strip("_")
+    while "__" in norm:
+        norm = norm.replace("__", "_")
+    return norm
+
+
+def _flatten_terp_source(source: Any) -> dict[str, Any]:
+    """Flatten common terp payload shapes to a normalized dict keyed by terp name."""
+    if source is None:
+        return {}
+    if isinstance(source, dict):
+        flat: dict[str, Any] = {}
+        for k, v in source.items():
+            nk = _normalize_terp_key(k)
+            if nk:
+                flat[nk] = v
+        return flat
+    if isinstance(source, list):
+        flat = {}
+        for item in source:
+            if not isinstance(item, dict):
+                continue
+            name_key = (
+                item.get("name")
+                or item.get("displayName")
+                or item.get("key")
+                or item.get("label")
+                or (item.get("terpene") or {}).get("name")
+                or (item.get("terpene") or {}).get("displayName")
+                or ""
+            )
+            nk = _normalize_terp_key(name_key)
+            if not nk:
+                continue
+            terp_meta = item.get("terpene") if isinstance(item.get("terpene"), dict) else {}
+            if "value" in item:
+                flat[nk] = item.get("value")
+            elif "percent" in item:
+                flat[nk] = item.get("percent")
+            elif "displayValue" in item:
+                flat[nk] = item.get("displayValue")
+            elif "amount" in item:
+                flat[nk] = item.get("amount")
+            elif "quantity" in item:
+                flat[nk] = item.get("quantity")
+            elif "value" in terp_meta:
+                flat[nk] = terp_meta.get("value")
+            elif "percent" in terp_meta:
+                flat[nk] = terp_meta.get("percent")
+            elif "displayValue" in terp_meta:
+                flat[nk] = terp_meta.get("displayValue")
+        return flat
+    return {}
+
+
+def _extract_terps(data: dict[str, Any], key_map: dict[str, str]) -> dict[str, float | None]:
+    """Extract PA Big 8 terpenes into standardized terp_* columns."""
+    result: dict[str, float | None] = {}
+    aliases_by_terp = {
+        "myrcene": ("b_myrcene", "beta_myrcene", "beta myrcene"),
+        "caryophyllene": ("b_caryophyllene", "beta_caryophyllene", "beta caryophyllene"),
+        "limonene": ("d_limonene",),
+        "terpinolene": ("alpha_terpinolene",),
+        "linalool": (),
+        "humulene": ("alpha_humulene",),
+        "ocimene": ("beta_ocimene", "alpha_ocimene"),
+    }
+    for terp_name in PA_BIG_8_TERPENES:
+        src_key = key_map.get(terp_name, terp_name)
+        val = _coerce_percent_scalar(data.get(src_key))
+        if val is None:
+            for alias in aliases_by_terp.get(terp_name, ()):
+                val = _coerce_percent_scalar(data.get(alias))
+                if val is not None:
+                    break
+
+        if terp_name == "pinene" and val is None:
+            alpha = (
+                _coerce_percent_scalar(data.get("a_pinene"))
+                or _coerce_percent_scalar(data.get("alpha_pinene"))
+                or _coerce_percent_scalar(data.get("alpha pinene"))
+                or 0.0
+            )
+            beta = (
+                _coerce_percent_scalar(data.get("b_pinene"))
+                or _coerce_percent_scalar(data.get("beta_pinene"))
+                or _coerce_percent_scalar(data.get("beta pinene"))
+                or 0.0
+            )
+            val = (alpha + beta) if (alpha or beta) else None
+
+        result[f"terp_{terp_name}"] = val
+    return result
+
+
+def _compute_terp_total(values: dict[str, Any]) -> float | None:
+    explicit_total = _coerce_percent_scalar(
+        values.get("terp_total")
+        or values.get("total_terpenes")
+        or values.get("total terpenes")
+        or values.get("terpenes_total")
+    )
+    if explicit_total is not None:
+        return explicit_total
+
+    total = 0.0
+    found = False
+    for terp_name in PA_BIG_8_TERPENES:
+        parsed = _coerce_percent_scalar(values.get(f"terp_{terp_name}"))
+        if parsed is None:
+            continue
+        total += parsed
+        found = True
+    return total if found else None
+
+
+def _extract_iheartjane_terps_from_description(description: str) -> dict[str, Any]:
+    """Conservative text parser: extract explicit terp percentages only.
+
+    Supported examples:
+    - "Myrcene 0.42%"
+    - "0.42% Myrcene"
+    - "Beta Caryophyllene: 0.31%"
+    - "Total Terpenes 2.5%"
+    """
+    text = (description or "").replace("\u00a0", " ").strip()
+    parsed = {f"terp_{name}": None for name in PA_BIG_8_TERPENES}
+    parsed["terp_total"] = None
+    parsed["terp_text_parsed"] = 0
+    parsed["terp_names_present"] = 0
+    if not text:
+        return parsed
+
+    text_cf = text.casefold()
+    if any(name in text_cf for name in TERP_DISPLAY_NAMES.values()):
+        parsed["terp_names_present"] = 1
+
+    alias_patterns = {
+        "myrcene": r"(?:myrcene|beta[\s-]*myrcene)",
+        "caryophyllene": r"(?:caryophyllene|beta[\s-]*caryophyllene)",
+        "limonene": r"(?:limonene|d[\s-]*limonene)",
+        "terpinolene": r"(?:terpinolene|alpha[\s-]*terpinolene)",
+        "linalool": r"linalool",
+        "pinene": r"(?:pinene|alpha[\s-]*pinene|beta[\s-]*pinene)",
+        "humulene": r"(?:humulene|alpha[\s-]*humulene)",
+        "ocimene": r"(?:ocimene|alpha[\s-]*ocimene|beta[\s-]*ocimene)",
+    }
+
+    pct_num = r"(\d{1,2}(?:\.\d{1,4})?)"
+
+    def _find_pct_for_name(pattern: str) -> float | None:
+        # Name before value
+        m = re.search(
+            rf"{pattern}\s*(?:[:\-]|\bis\b)?\s*{pct_num}\s*%",
+            text,
+            re.IGNORECASE,
+        )
+        if m:
+            return _coerce_percent_scalar(m.group(1))
+        # Value before name
+        m = re.search(
+            rf"{pct_num}\s*%\s*(?:{pattern})",
+            text,
+            re.IGNORECASE,
+        )
+        if m:
+            return _coerce_percent_scalar(m.group(1))
+        return None
+
+    for terp_name in PA_BIG_8_TERPENES:
+        val = _find_pct_for_name(alias_patterns[terp_name])
+        parsed[f"terp_{terp_name}"] = val
+        if val is not None:
+            parsed["terp_text_parsed"] = 1
+
+    total_match = re.search(
+        rf"(?:total\s+terpenes?|terpenes?\s+total)\s*(?:[:\-]|\bis\b)?\s*{pct_num}\s*%",
+        text,
+        re.IGNORECASE,
+    )
+    if total_match:
+        parsed["terp_total"] = _coerce_percent_scalar(total_match.group(1))
+        parsed["terp_text_parsed"] = 1
+    else:
+        # Conservative fallback: sum parsed Big 8 only if we found multiple explicit terp values.
+        explicit_count = sum(
+            1 for terp_name in PA_BIG_8_TERPENES
+            if parsed.get(f"terp_{terp_name}") is not None
+        )
+        if explicit_count >= 2:
+            parsed["terp_total"] = _compute_terp_total(parsed)
+            if parsed["terp_total"] is not None:
+                parsed["terp_text_parsed"] = 1
+
+    return parsed
+
+
+def _extract_iheartjane_terps_from_lab_results(lab_results: Any) -> dict[str, Any]:
+    """Structured iHeartJane parser using Algolia `lab_results` payload (no text parsing)."""
+    parsed = {f"terp_{name}": None for name in PA_BIG_8_TERPENES}
+    parsed["terp_total"] = None
+    parsed["terp_text_parsed"] = 0
+    parsed["terp_structured_parsed"] = 0
+    parsed["terp_names_present"] = 0
+
+    compounds: list[dict[str, Any]] = []
+    if isinstance(lab_results, list):
+        for entry in lab_results:
+            if not isinstance(entry, dict):
+                continue
+            nested = entry.get("lab_results")
+            if isinstance(nested, list):
+                for compound in nested:
+                    if isinstance(compound, dict):
+                        compounds.append(compound)
+            elif any(k in entry for k in ("compound_name", "unit_id", "name")):
+                compounds.append(entry)
+    elif isinstance(lab_results, dict):
+        nested = lab_results.get("lab_results")
+        if isinstance(nested, list):
+            for compound in nested:
+                if isinstance(compound, dict):
+                    compounds.append(compound)
+
+    if not compounds:
+        return parsed
+
+    flat: dict[str, Any] = {}
+    for c in compounds:
+        unit = str(c.get("unit") or c.get("unitAbbr") or c.get("unit_abbr") or "").strip()
+        if unit and unit != "%":
+            continue
+        name = c.get("compound_name") or c.get("unit_id") or c.get("name") or ""
+        nk = _normalize_terp_key(name)
+        if not nk:
+            continue
+        if any(t in nk for t in PA_BIG_8_TERPENES) or "terp" in nk:
+            parsed["terp_names_present"] = 1
+        val = _coerce_percent_scalar(c.get("value"))
+        if val is None:
+            val = _coerce_percent_scalar(c.get("percent"))
+        if val is None:
+            val = _coerce_percent_scalar(c.get("displayValue"))
+        if val is None:
+            continue
+        prev = _coerce_percent_scalar(flat.get(nk))
+        # Prefer a stable non-null value if repeated across price IDs; use max to avoid rounding drift.
+        flat[nk] = max(prev, val) if prev is not None else val
+
+    terps = _extract_terps(flat, {})
+    parsed.update(terps)
+    parsed["terp_total"] = _compute_terp_total({**terps, **flat})
+    if parsed["terp_total"] is not None or any(parsed.get(f"terp_{n}") is not None for n in PA_BIG_8_TERPENES):
+        parsed["terp_structured_parsed"] = 1
+    return parsed
+
+
+def _normalize_iheartjane(
+    product: dict,
+    idx: int,
+    store: dict,
+    iheartjane_text_fallback: bool = False,
+) -> dict:
+    terps = _extract_iheartjane_terps_from_lab_results(product.get("lab_results"))
+    source = "none"
+    structured_total = _coerce_percent_scalar(terps.get("terp_total"))
+    if int(terps.get("terp_structured_parsed") or 0) != 0:
+        source = "jane_structured"
+
+    if iheartjane_text_fallback and (structured_total is None or structured_total <= 0):
+        text_terps = _extract_iheartjane_terps_from_description(str(product.get("description") or ""))
+        if product.get("terpenes") or terps.get("terp_names_present"):
+            text_terps["terp_names_present"] = 1
+        if int(text_terps.get("terp_text_parsed") or 0) != 0:
+            terps = text_terps
+            source = "jane_text"
+
+    if product.get("terpenes") and not terps.get("terp_names_present"):
+        terps["terp_names_present"] = 1
+    row = {
         "registry_index": idx,
         "operator": store["operator"],
         "city": store["city"],
@@ -221,7 +601,10 @@ def _normalize_iheartjane(product: dict, idx: int, store: dict) -> dict:
         "discounted_price": product.get("discounted_price"),
         "special_title": product.get("special_title") or "",
         "thc_pct": product.get("percent_thc"),
+        "_meta_source": source,
     }
+    row.update(terps)
+    return row
 
 
 def _normalize_trulieve(product: dict, idx: int, store: dict, category: str) -> dict:
@@ -236,7 +619,12 @@ def _normalize_trulieve(product: dict, idx: int, store: dict, category: str) -> 
     special_title = specials[0].get("title", "") if specials else ""
     thc = product.get("thc_content")
     thc_pct = float(thc) if thc and product.get("thc_content_unit") == "%" else None
-    return {
+    trulieve_terps_list = product.get("terpenes") or []
+    flat_terps = _flatten_terp_source(trulieve_terps_list)
+    terps = _extract_terps(flat_terps, {})
+    terps["terp_total"] = _compute_terp_total({**terps, **flat_terps})
+
+    row = {
         "registry_index": idx,
         "operator": store["operator"],
         "city": store["city"],
@@ -250,7 +638,11 @@ def _normalize_trulieve(product: dict, idx: int, store: dict, category: str) -> 
         "discounted_price": float(sale_price) if sale_price else None,
         "special_title": special_title,
         "thc_pct": thc_pct,
+        "terp_names_present": 1 if trulieve_terps_list else 0,
+        "_meta_source": "trulieve_nested",
     }
+    row.update(terps)
+    return row
 
 
 def _normalize_cresco(product: dict, idx: int, store: dict, category: str) -> dict:
@@ -261,8 +653,23 @@ def _normalize_cresco(product: dict, idx: int, store: dict, category: str) -> di
     base_price = product.get("price")
     disc_price = product.get("discounted_price")
     special = (product.get("applied_special") or {}).get("special_name") or ""
-    thc_raw = product.get("bt_potency_thc") or (product.get("potency") or {}).get("thc")
-    return {
+    potency = product.get("potency") or {}
+    thc_raw = product.get("bt_potency_thc") or potency.get("thc")
+    terps = _extract_terps(
+        potency,
+        {
+            "myrcene": "b_myrcene",
+            "caryophyllene": "b_caryophyllene",
+            "pinene": "pinene",
+        },
+    )
+    terps["terp_total"] = _compute_terp_total(
+        {
+            **terps,
+            "total_terpenes": potency.get("total_terpenes"),
+        }
+    )
+    row = {
         "registry_index": idx,
         "operator": store["operator"],
         "city": store["city"],
@@ -276,7 +683,11 @@ def _normalize_cresco(product: dict, idx: int, store: dict, category: str) -> di
         "discounted_price": float(disc_price) if disc_price and disc_price != base_price else None,
         "special_title": special,
         "thc_pct": float(thc_raw) if thc_raw else None,
+        "terp_names_present": 1 if potency else 0,
+        "_meta_source": "cresco_api",
     }
+    row.update(terps)
+    return row
 
 
 def _normalize_sweedpos(product: dict, idx: int, store: dict, category_name: str) -> list[dict]:
@@ -296,8 +707,26 @@ def _normalize_sweedpos(product: dict, idx: int, store: dict, category_name: str
         thc_vals = thc_data.get("value") or []
         thc_unit = thc_data.get("unitAbbr") or "%"
         thc_pct = float(thc_vals[0]) if thc_vals and thc_unit == "%" else None
+
+        terp_source: Any = (
+            lab.get("terpenes")
+            or variant.get("terpenes")
+            or product.get("terpenes")
+            or lab
+        )
+        flat_terps = _flatten_terp_source(terp_source)
+        strain_terps_names = _flatten_terp_source((product.get("strain") or {}).get("terpenes"))
+        terp_names_present = 1 if (flat_terps or strain_terps_names) else 0
+
+        terps = _extract_terps(flat_terps, {})
+        terps["terp_total"] = _compute_terp_total(
+            {
+                **terps,
+                **flat_terps,
+            }
+        )
         vname = variant.get("name") or ""
-        rows.append({
+        row = {
             "registry_index": idx,
             "operator": store["operator"],
             "city": store["city"],
@@ -311,7 +740,11 @@ def _normalize_sweedpos(product: dict, idx: int, store: dict, category_name: str
             "discounted_price": float(promo) if promo and promo != price else None,
             "special_title": special_title,
             "thc_pct": thc_pct,
-        })
+            "terp_names_present": terp_names_present,
+            "_meta_source": "sweed_labtests" if flat_terps else ("sweed_strain_names" if strain_terps_names else "none"),
+        }
+        row.update(terps)
+        rows.append(row)
     return rows
 
 
@@ -319,9 +752,21 @@ def _normalize_sweedpos(product: dict, idx: int, store: dict, category_name: str
 # Per-platform scrape dispatchers
 # ---------------------------------------------------------------------------
 
-def _scrape_iheartjane(store: dict, idx: int) -> list[dict]:
+def _scrape_iheartjane(
+    store: dict,
+    idx: int,
+    iheartjane_text_fallback: bool = False,
+) -> list[dict]:
     products = iheartjane.fetch_all_products(int(store["jane_store_id"]))
-    return [_normalize_iheartjane(p, idx, store) for p in products]
+    return [
+        _normalize_iheartjane(
+            p,
+            idx,
+            store,
+            iheartjane_text_fallback=iheartjane_text_fallback,
+        )
+        for p in products
+    ]
 
 
 def _scrape_trulieve(store: dict, idx: int) -> list[dict]:
@@ -371,6 +816,10 @@ def _scrape_sweedpos(store: dict, idx: int) -> list[dict]:
 def scrape_all(db: sqlite_utils.Database, config: dict[str, Any]) -> int:
     stores: list[dict[str, Any]] = json.loads(STORES_PATH.read_text())["stores"]
     selected = filter_stores(stores, config)
+    notifications = config.get("notifications") if isinstance(config, dict) else {}
+    if not isinstance(notifications, dict):
+        notifications = {}
+    iheartjane_text_fallback = bool(notifications.get("iheartjane_text_fallback", False))
 
     if not selected:
         console.print("[yellow]No stores matched the current filter. Check watch_config.json.[/yellow]")
@@ -387,7 +836,11 @@ def scrape_all(db: sqlite_utils.Database, config: dict[str, Any]) -> int:
         console.print(f"  [dim]{label}...[/dim]", end=" ")
         try:
             if platform == "iheartjane":
-                rows = _scrape_iheartjane(store, idx)
+                rows = _scrape_iheartjane(
+                    store,
+                    idx,
+                    iheartjane_text_fallback=iheartjane_text_fallback,
+                )
             elif platform == "trulieve_rest":
                 rows = _scrape_trulieve(store, idx)
             elif platform == "cresco_labs":
@@ -399,6 +852,9 @@ def scrape_all(db: sqlite_utils.Database, config: dict[str, Any]) -> int:
                 continue
 
             for r in rows:
+                # Runtime metadata for diagnostics; never persist to snapshots.
+                for k in [k for k in r.keys() if str(k).startswith("_meta_")]:
+                    r.pop(k, None)
                 r["scraped_at"] = scraped_at
 
             db["snapshots"].upsert_all(
@@ -424,37 +880,36 @@ def scrape_all(db: sqlite_utils.Database, config: dict[str, Any]) -> int:
 
 DEAL_DIGEST_SQL = """
 WITH ranked AS (
-  SELECT
-    registry_index, operator, city, name, brand, category, subcategory,
-    price, discounted_price, special_title, thc_pct, scraped_at,
+  SELECT *,
     LAG(discounted_price) OVER (
       PARTITION BY registry_index, product_id ORDER BY scraped_at
     ) AS prev_disc
   FROM snapshots
   WHERE registry_index IN ({placeholders})
 )
-SELECT operator, city, name, brand, category, subcategory,
-       price, discounted_price, special_title, thc_pct, prev_disc
+SELECT *
 FROM ranked
 WHERE scraped_at = (SELECT MAX(scraped_at) FROM snapshots)
   AND discounted_price IS NOT NULL
   AND (prev_disc IS NULL OR discounted_price < prev_disc)
 ORDER BY ROUND(100.0 * (price - discounted_price) / price, 1) DESC,
          discounted_price ASC
-LIMIT 100
+LIMIT {row_limit}
 """
 
 CURRENT_DEALS_SQL = """
-SELECT operator, city, name, brand, category, subcategory,
-       price, discounted_price, special_title, thc_pct
+SELECT *
 FROM snapshots
 WHERE scraped_at = (SELECT MAX(scraped_at) FROM snapshots)
   AND registry_index IN ({placeholders})
   AND discounted_price IS NOT NULL
 ORDER BY ROUND(100.0 * (price - discounted_price) / price, 1) DESC,
          discounted_price ASC
-LIMIT 100
+LIMIT {row_limit}
 """
+
+DIGEST_QUERY_LIMIT = 500
+DIGEST_RENDER_LIMIT = 100
 
 
 def _pct_off(price: float | None, disc: float | None) -> float | None:
@@ -473,6 +928,240 @@ def _pct_style(pct: float | None) -> str:
     return "green"
 
 
+def _notification_config(config: dict[str, Any]) -> dict[str, Any]:
+    notifications = config.get("notifications") or {}
+    unicorns = [str(x).strip() for x in notifications.get("unicorns", []) if str(x).strip()]
+    aliases_raw = notifications.get("aliases") or {}
+    aliases: dict[str, list[str]] = {}
+    if isinstance(aliases_raw, dict):
+        for key, value in aliases_raw.items():
+            canon = str(key).strip()
+            if not canon:
+                continue
+            if isinstance(value, list):
+                vals = [str(v).strip() for v in value if str(v).strip()]
+            elif value is None:
+                vals = []
+            else:
+                vals = [str(value).strip()] if str(value).strip() else []
+            aliases[canon] = vals
+    else:
+        log.warning("notifications.aliases should be an object; ignoring %r", type(aliases_raw).__name__)
+    ignore_brands = [str(x).strip() for x in notifications.get("ignore_brands", []) if str(x).strip()]
+    match_mode = str(notifications.get("match_mode", "contains")).strip().lower()
+    show_unicorn_summary = bool(notifications.get("show_unicorn_summary", True))
+    show_ignored_summary = bool(notifications.get("show_ignored_summary", False))
+    terp_thresholds_raw = notifications.get("terp_thresholds") or {}
+    terp_thresholds: dict[str, float] = {}
+    if isinstance(terp_thresholds_raw, dict):
+        for raw_key, raw_val in terp_thresholds_raw.items():
+            key_text = str(raw_key).strip().casefold()
+            if not key_text:
+                continue
+            if key_text == "terp_ratio":
+                norm_key = "terp_ratio"
+            elif key_text.startswith("terp_"):
+                norm_key = key_text
+            else:
+                norm_key = f"terp_{key_text}"
+            parsed = _coerce_percent_scalar(raw_val)
+            if parsed is None:
+                log.warning("Ignoring invalid terp threshold %r=%r", raw_key, raw_val)
+                continue
+            if parsed < 0:
+                log.warning("Ignoring negative terp threshold %r=%r", raw_key, raw_val)
+                continue
+            terp_thresholds[norm_key] = parsed
+    else:
+        log.warning(
+            "notifications.terp_thresholds should be an object; ignoring %r",
+            type(terp_thresholds_raw).__name__,
+        )
+    if match_mode not in {"contains", "exact"}:
+        log.warning("Unknown notifications.match_mode %r, using 'contains'", match_mode)
+        match_mode = "contains"
+    unicorn_needles: list[str] = []
+    seen_needles: set[str] = set()
+    unicorn_canonical_by_needle_cf: dict[str, str] = {}
+    for needle in unicorns:
+        key = needle.casefold()
+        if key not in seen_needles:
+            seen_needles.add(key)
+            unicorn_needles.append(needle)
+        unicorn_canonical_by_needle_cf[key] = needle
+    for canon, variants in aliases.items():
+        canon_cf = canon.casefold()
+        if canon_cf not in unicorn_canonical_by_needle_cf:
+            unicorn_canonical_by_needle_cf[canon_cf] = canon
+        for needle in [canon, *variants]:
+            key = needle.casefold()
+            if key not in seen_needles:
+                seen_needles.add(key)
+                unicorn_needles.append(needle)
+            unicorn_canonical_by_needle_cf[key] = canon
+    return {
+        "unicorns": unicorns,
+        "aliases": aliases,
+        "unicorn_needles": unicorn_needles,
+        "unicorn_canonical_by_needle_cf": unicorn_canonical_by_needle_cf,
+        "ignore_brands": ignore_brands,
+        "match_mode": match_mode,
+        "show_unicorn_summary": show_unicorn_summary,
+        "show_ignored_summary": show_ignored_summary,
+        "terp_thresholds": terp_thresholds,
+    }
+
+
+def _match_unicorn_canonical(
+    name: str,
+    unicorns: list[str],
+    canonical_by_needle_cf: dict[str, str],
+    match_mode: str,
+) -> str | None:
+    if not name or not unicorns:
+        return None
+    hay = name.casefold()
+    if match_mode == "exact":
+        return canonical_by_needle_cf.get(hay)
+    for needle in unicorns:
+        needle_cf = needle.casefold()
+        if needle_cf in hay:
+            return canonical_by_needle_cf.get(needle_cf, needle)
+    return None
+
+
+def _infer_terp_source_label(row: dict[str, Any]) -> tuple[str, bool]:
+    """Return (display label, is_known_blind_source) for digest audit reporting."""
+    platform = str(row.get("platform") or "")
+    if platform == "iheartjane" and int(row.get("terp_structured_parsed") or 0) != 0:
+        return ("iHeartJane Lab Results", False)
+    if platform == "iheartjane" and int(row.get("terp_text_parsed") or 0) != 0:
+        return ("iHeartJane Text Parse", False)
+    if platform == "cresco_labs":
+        return ("Cresco API", False)
+    if platform == "sweedpos":
+        return ("Sweed LabTests", False)
+    if platform == "trulieve_rest":
+        return ("Trulieve Structured", False)
+    if platform == "iheartjane":
+        return ("iHeartJane", True)
+    return (platform or "Unknown", False)
+
+
+def _infer_terp_parse_confidence(row: dict[str, Any]) -> str | None:
+    """Runtime-only confidence marker for audit/reporting (not persisted as a schema field)."""
+    platform = str(row.get("platform") or "")
+    if platform == "iheartjane":
+        if int(row.get("terp_structured_parsed") or 0) != 0:
+            return "high"
+        if int(row.get("terp_text_parsed") or 0) != 0:
+            return "high"
+        return None
+    if platform in {"cresco_labs", "trulieve_rest"}:
+        return "high"
+    if platform == "sweedpos":
+        # Sweed currently often exposes names without numeric terp percentages in this dataset shape.
+        return None
+    return None
+
+
+def _render_data_quality_audit(db: sqlite_utils.Database, selected_indices: list[int]) -> None:
+    if not selected_indices:
+        return
+    ph = ",".join("?" * len(selected_indices))
+    audit_sql = f"""
+    SELECT platform,
+           COALESCE(terp_structured_parsed, 0) AS terp_structured_parsed,
+           COALESCE(terp_text_parsed, 0) AS terp_text_parsed,
+           COUNT(*) AS total_items,
+           SUM(CASE WHEN terp_total IS NOT NULL THEN 1 ELSE 0 END) AS terp_rich_items,
+           SUM(CASE WHEN COALESCE(terp_names_present, 0) != 0 THEN 1 ELSE 0 END) AS terp_name_items
+    FROM snapshots
+    WHERE scraped_at = (SELECT MAX(scraped_at) FROM snapshots)
+      AND registry_index IN ({ph})
+    GROUP BY platform, COALESCE(terp_structured_parsed, 0), COALESCE(terp_text_parsed, 0)
+    ORDER BY total_items DESC, platform ASC
+    """
+    rows = list(db.query(audit_sql, selected_indices))
+    if not rows:
+        return
+
+    jane_diag_sql = f"""
+    SELECT
+      SUM(
+        CASE
+          WHEN platform = 'iheartjane'
+           AND COALESCE(terp_structured_parsed, 0) = 0
+           AND COALESCE(terp_text_parsed, 0) = 0
+           AND COALESCE(terp_names_present, 0) != 0
+          THEN 1 ELSE 0
+        END
+      ) AS jane_names_only,
+      SUM(
+        CASE
+          WHEN platform = 'iheartjane'
+           AND COALESCE(terp_structured_parsed, 0) = 0
+           AND COALESCE(terp_text_parsed, 0) = 0
+           AND COALESCE(terp_names_present, 0) = 0
+          THEN 1 ELSE 0
+        END
+      ) AS jane_blind,
+      SUM(
+        CASE
+          WHEN platform = 'iheartjane'
+           AND COALESCE(terp_structured_parsed, 0) = 0
+           AND COALESCE(terp_text_parsed, 0) != 0
+           AND terp_total IS NULL
+          THEN 1 ELSE 0
+        END
+      ) AS jane_text_partial_or_malformed
+    FROM snapshots
+    WHERE scraped_at = (SELECT MAX(scraped_at) FROM snapshots)
+      AND registry_index IN ({ph})
+    """
+    jane_diag = next(iter(db.query(jane_diag_sql, selected_indices)), {}) or {}
+    jane_names_only = int(jane_diag.get("jane_names_only") or 0)
+    jane_blind = int(jane_diag.get("jane_blind") or 0)
+    jane_text_partial_or_malformed = int(jane_diag.get("jane_text_partial_or_malformed") or 0)
+
+    audit = Table(title="Data Quality Audit", box=box.SIMPLE, header_style="dim cyan")
+    audit.add_column("Source")
+    audit.add_column("Items", justify="right")
+    audit.add_column("Terp Coverage", justify="right")
+    audit.add_column("Notes", style="dim")
+    for r in rows:
+        label, known_blind = _infer_terp_source_label(r)
+        confidence = _infer_terp_parse_confidence(r)
+        count = int(r.get("total_items") or 0)
+        covered = int(r.get("terp_rich_items") or 0)
+        name_items = int(r.get("terp_name_items") or 0)
+        pct = (100.0 * covered / count) if count else 0.0
+        note_parts = []
+        if confidence:
+            note_parts.append(f"CONF: {confidence.upper()}")
+        if name_items > 0 and covered == 0:
+            note_parts.append("NAMES ONLY (no % values in payload)")
+        if known_blind and covered == 0 and name_items == 0:
+            note_parts.append("BLIND")
+        if label == "iHeartJane" and (jane_names_only or jane_blind):
+            note_parts.append(
+                f"fallback misses: names-only={jane_names_only}, blind={jane_blind}"
+            )
+        if label == "iHeartJane Text Parse" and count > covered:
+            note_parts.append(
+                "text misses: "
+                f"{count - covered} (likely partial/malformed numeric={jane_text_partial_or_malformed})"
+            )
+        note = " | ".join(note_parts)
+        audit.add_row(
+            label,
+            str(count),
+            f"{covered}/{count} ({pct:.0f}%)",
+            note,
+        )
+    console.print(audit)
+
+
 def render_digest(db: sqlite_utils.Database, config: dict[str, Any]) -> None:
     if "snapshots" not in db.table_names():
         console.print("[yellow]No data yet. Run without --digest first.[/yellow]")
@@ -487,17 +1176,160 @@ def render_digest(db: sqlite_utils.Database, config: dict[str, Any]) -> None:
     ph = ",".join("?" * len(selected_indices))
     run_count = db.execute("SELECT COUNT(DISTINCT scraped_at) FROM snapshots").fetchone()[0]
     use_new = run_count >= 2
+    notif = _notification_config(config)
+    show_data_quality_audit = notif["show_ignored_summary"]
 
-    sql = (DEAL_DIGEST_SQL if use_new else CURRENT_DEALS_SQL).format(placeholders=ph)
-    rows = list(db.execute(sql, selected_indices).fetchall())
+    sql = (DEAL_DIGEST_SQL if use_new else CURRENT_DEALS_SQL).format(
+        placeholders=ph,
+        row_limit=DIGEST_QUERY_LIMIT,
+    )
+    rows = list(db.query(sql, selected_indices))
 
     if not rows:
         console.print("[dim]No deals in latest snapshot.[/dim]")
+        if show_data_quality_audit:
+            _render_data_quality_audit(db, selected_indices)
         return
 
-    from rich.text import Text
+    ignore_brands_cf = {b.casefold() for b in notif["ignore_brands"]}
+    unicorn_needles = notif["unicorn_needles"]
+    unicorn_canonical_by_needle_cf = notif["unicorn_canonical_by_needle_cf"]
+    match_mode = notif["match_mode"]
+    show_unicorn_summary = notif["show_unicorn_summary"]
+    show_ignored_summary = notif["show_ignored_summary"]
+    terp_thresholds = notif["terp_thresholds"]
+    show_data_quality_audit = show_ignored_summary
 
-    title = "New & Improved Deals" if use_new else "All Current Deals"
+    filtered_rows: list[dict[str, Any]] = []
+    ignored_count = 0
+    terp_reject_count = 0
+    terp_reject_missing_count = 0
+    terp_reject_below_count = 0
+    terp_reject_by_platform: dict[str, int] = {}
+    unicorn_count = 0
+    ignored_brand_summary: dict[str, dict[str, Any]] = {}
+    unicorn_summary: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        op = str(r.get("operator") or "")
+        city = str(r.get("city") or "")
+        name = str(r.get("name") or "")
+        brand = r.get("brand")
+        platform_name = str(r.get("platform") or "unknown")
+        brand_text = str(brand or "").strip()
+        if brand_text and brand_text.casefold() in ignore_brands_cf:
+            ignored_count += 1
+            if show_ignored_summary:
+                entry = ignored_brand_summary.setdefault(
+                    brand_text,
+                    {"count": 0, "stores": set(), "sample_names": []},
+                )
+                entry["count"] += 1
+                entry["stores"].add(f"{op} / {city}")
+                if len(entry["sample_names"]) < 3 and name:
+                    entry["sample_names"].append(str(name)[:42])
+            continue
+
+        terp_total = _coerce_percent_scalar(r.get("terp_total"))
+        thc_pct = _coerce_percent_scalar(r.get("thc_pct"))
+        terp_ratio = (terp_total / thc_pct) if (terp_total is not None and thc_pct and thc_pct > 0) else None
+
+        if terp_thresholds:
+            reject = False
+            reject_reason = "below"
+            for key, min_val in terp_thresholds.items():
+                if key == "terp_ratio":
+                    if terp_ratio is None:
+                        reject = True
+                        reject_reason = "missing"
+                        break
+                    if terp_ratio < min_val:
+                        reject = True
+                        reject_reason = "below"
+                        break
+                    continue
+                val = _coerce_percent_scalar(r.get(key))
+                if val is None:
+                    reject = True
+                    reject_reason = "missing"
+                    break
+                if val < min_val:
+                    reject = True
+                    reject_reason = "below"
+                    break
+            if reject:
+                terp_reject_count += 1
+                if reject_reason == "missing":
+                    terp_reject_missing_count += 1
+                else:
+                    terp_reject_below_count += 1
+                terp_reject_by_platform[platform_name] = terp_reject_by_platform.get(platform_name, 0) + 1
+                continue
+
+        unicorn_canonical = _match_unicorn_canonical(
+            name,
+            unicorn_needles,
+            unicorn_canonical_by_needle_cf,
+            match_mode,
+        )
+        is_unicorn = unicorn_canonical is not None
+        if unicorn_canonical:
+            unicorn_count += 1
+            entry = unicorn_summary.setdefault(
+                unicorn_canonical,
+                {"count": 0, "sample_names": []},
+            )
+            entry["count"] += 1
+            if len(entry["sample_names"]) < 3 and name:
+                entry["sample_names"].append(str(name)[:42])
+        filtered_rows.append(
+            {
+                "row": r,
+                "is_unicorn": is_unicorn,
+                "unicorn_canonical": unicorn_canonical,
+                "terp_total": terp_total,
+                "terp_ratio": terp_ratio,
+            }
+        )
+
+    if not filtered_rows:
+        if ignored_count or terp_reject_count:
+            reasons = []
+            if ignored_count:
+                reasons.append("ignored brands")
+            if terp_reject_count:
+                reasons.append("terp thresholds")
+            console.print(f"[dim]Deals were found, but all were filtered by {', '.join(reasons)}.[/dim]")
+        else:
+            console.print("[dim]No deals in latest snapshot.[/dim]")
+        if show_ignored_summary and ignored_brand_summary:
+            summary = Table(
+                title=f"Ignored Brand Summary ({ignored_count} filtered items)",
+                box=box.SIMPLE,
+                header_style="dim red",
+            )
+            summary.add_column("Brand")
+            summary.add_column("Ignored Deals", justify="right")
+            summary.add_column("Stores", justify="right")
+            summary.add_column("Examples", style="dim")
+            for brand_name, meta in sorted(
+                ignored_brand_summary.items(),
+                key=lambda item: (-item[1]["count"], item[0].casefold()),
+            ):
+                summary.add_row(
+                    brand_name,
+                    str(meta["count"]),
+                    str(len(meta["stores"])),
+                    ", ".join(meta["sample_names"]) or "—",
+                )
+            console.print(summary)
+        if show_data_quality_audit:
+            _render_data_quality_audit(db, selected_indices)
+        return
+
+    final_rows = filtered_rows[:DIGEST_RENDER_LIMIT]
+
+    title_extra = f" — {unicorn_count} 🦄 Found" if unicorn_count else ""
+    title = ("New & Improved Deals" if use_new else "All Current Deals") + title_extra
     table = Table(title=f"PA Dispensary Deal Digest — {title}",
                   box=box.ROUNDED, header_style="bold cyan",
                   border_style="dim", show_header=True)
@@ -506,24 +1338,49 @@ def render_digest(db: sqlite_utils.Database, config: dict[str, Any]) -> None:
     table.add_column("Brand", style="dim")
     table.add_column("Subcat.", style="dim", no_wrap=True)
     table.add_column("THC%", justify="right", style="dim")
+    table.add_column("Terps", justify="right", style="bold yellow", no_wrap=True)
     table.add_column("Was", justify="right", style="dim red")
     table.add_column("Now", justify="right", style="bold green")
     table.add_column("% Off", justify="right", no_wrap=True)
     table.add_column("Special", style="dim italic")
 
-    col_count = 11 if use_new else 10
-    for r in rows:
-        if use_new:
-            op, city, name, brand, cat, subcat, price, disc, special, thc, prev_disc = r
-        else:
-            op, city, name, brand, cat, subcat, price, disc, special, thc = r
+    for item in final_rows:
+        r = item["row"]
+        is_unicorn = item["is_unicorn"]
+        unicorn_canonical = item["unicorn_canonical"]
+        op = str(r.get("operator") or "")
+        city = str(r.get("city") or "")
+        name = str(r.get("name") or "")
+        brand = r.get("brand")
+        cat = r.get("category")
+        subcat = r.get("subcategory")
+        price = _coerce_percent_scalar(r.get("price"))
+        disc = _coerce_percent_scalar(r.get("discounted_price"))
+        special = r.get("special_title")
+        thc = _coerce_percent_scalar(r.get("thc_pct"))
         pct = _pct_off(price, disc)
+        product_label = f"🦄 {name}" if is_unicorn else (name or "")
+        product_cell = Text(
+            str(product_label)[:62],
+            style="bold magenta" if is_unicorn else "",
+        )
+        if is_unicorn and unicorn_canonical and unicorn_canonical.casefold() not in name.casefold():
+            product_cell.append(f" ({unicorn_canonical})", style="dim magenta")
+        terp_total = item["terp_total"]
+        terp_ratio = item["terp_ratio"]
+        if terp_total is None:
+            terp_cell = "—"
+        elif terp_ratio is None:
+            terp_cell = f"{terp_total:.1f}%"
+        else:
+            terp_cell = f"{terp_total:.1f}% ({terp_ratio:.2f})"
         table.add_row(
             f"{op}\n{city}",
-            name[:60],
+            product_cell,
             (brand or "")[:18],
             (subcat or cat or "")[:14],
             f"{thc:.1f}%" if thc else "—",
+            terp_cell,
             f"${price:.2f}" if price else "—",
             f"${disc:.2f}" if disc else "—",
             Text(f"{pct:.1f}%" if pct else "—", style=_pct_style(pct)),
@@ -531,8 +1388,89 @@ def render_digest(db: sqlite_utils.Database, config: dict[str, Any]) -> None:
         )
 
     console.print(table)
-    console.print(f"[dim]{len(rows)} deal{'s' if len(rows) != 1 else ''} "
-                  f"across {len({r[1] for r in rows})} stores[/dim]")
+    if show_unicorn_summary and unicorn_summary:
+        u_table = Table(
+            title=f"Unicorn Hits ({unicorn_count} total)",
+            box=box.SIMPLE,
+            header_style="bold magenta",
+        )
+        u_table.add_column("Canonical Unicorn")
+        u_table.add_column("Hits", justify="right")
+        u_table.add_column("Examples", style="dim")
+        for canon_name, meta in sorted(
+            unicorn_summary.items(),
+            key=lambda item: (-item[1]["count"], item[0].casefold()),
+        ):
+            u_table.add_row(
+                canon_name,
+                str(meta["count"]),
+                ", ".join(meta["sample_names"]) or "—",
+            )
+        console.print(u_table)
+
+    if show_ignored_summary and ignored_brand_summary:
+        summary = Table(
+            title=f"Ignored Brand Summary ({ignored_count} filtered items)",
+            box=box.SIMPLE,
+            header_style="dim red",
+        )
+        summary.add_column("Brand")
+        summary.add_column("Ignored Deals", justify="right")
+        summary.add_column("Stores", justify="right")
+        summary.add_column("Examples", style="dim")
+        for brand_name, meta in sorted(
+            ignored_brand_summary.items(),
+            key=lambda item: (-item[1]["count"], item[0].casefold()),
+        ):
+            summary.add_row(
+                brand_name,
+                str(meta["count"]),
+                str(len(meta["stores"])),
+                ", ".join(meta["sample_names"]) or "—",
+            )
+        console.print(summary)
+
+    if show_data_quality_audit:
+        _render_data_quality_audit(db, selected_indices)
+
+    if terp_reject_count:
+        t_table = Table(
+            title=f"Terp Filter Rejects ({terp_reject_count} rows)",
+            box=box.SIMPLE,
+            header_style="dim yellow",
+        )
+        t_table.add_column("Platform")
+        t_table.add_column("Rejected", justify="right")
+        for platform_name, count in sorted(
+            terp_reject_by_platform.items(),
+            key=lambda item: (-item[1], item[0]),
+        ):
+            t_table.add_row(platform_name, str(count))
+        console.print(t_table)
+
+    city_count = len({str(item["row"].get("city") or "") for item in final_rows})
+    console.print(
+        f"[dim]{len(final_rows)} deal{'s' if len(final_rows) != 1 else ''} "
+        f"across {city_count} stores"
+        f" (queried {len(rows)}, filtered {ignored_count} ignored-brand rows, "
+        + (
+            f"filtered {terp_reject_count} by terp thresholds, "
+            if terp_reject_count
+            else ""
+        )
+        + f"{unicorn_count} unicorn match{'es' if unicorn_count != 1 else ''}; "
+        + (
+            f"terp thresholds: {', '.join(f'{k}>={v:g}' for k, v in terp_thresholds.items())}; "
+            if terp_thresholds
+            else ""
+        )
+        + (
+            f"terp rejects missing={terp_reject_missing_count}, below={terp_reject_below_count}; "
+            if terp_reject_count
+            else ""
+        )
+        + f"showing top {len(final_rows)})[/dim]"
+    )
 
 
 # ---------------------------------------------------------------------------
