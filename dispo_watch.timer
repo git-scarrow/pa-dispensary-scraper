@@ -1,0 +1,10 @@
+[Unit]
+Description=Run PA dispensary deal watcher daily at 7am
+
+[Timer]
+OnCalendar=*-*-* 07:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

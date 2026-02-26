@@ -31,3 +31,6 @@ build/
 .cursor/
 AGENTS.md
 *.log
+
+# Personal config (customize locally)
+watch_config.json

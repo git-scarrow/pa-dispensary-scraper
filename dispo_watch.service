@@ -1,0 +1,11 @@
+[Unit]
+Description=PA Dispensary Deal Watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/dev/projects/pa-dispensary-scraper
+ExecStart=%h/dev/projects/pa-dispensary-scraper/.venv/bin/python dispo_watch.py --scrape
+StandardOutput=journal
+StandardError=journal
