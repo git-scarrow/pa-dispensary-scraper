@@ -7,30 +7,32 @@ venv/
 *.egg-info/
 dist/
 build/
-
 # Environment
 .env
 .env.*
-
 # Data / scratch
 *.db
 *.sqlite
 *.sqlite3
 /scratch/
 /tmp/
-
 # Editor
 .idea/
 .vscode/
 *.swp
 *~
-
 # Agent / editor configs
 .agents/
 .claude/
 .cursor/
 AGENTS.md
 *.log
-
 # Personal config (customize locally)
 watch_config.json
+.agents/local.json
+.agents/generated/
+.codex/
+.gemini/
+.vscode/mcp.json
+.claude/skills
+.antigravity/

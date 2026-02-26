@@ -145,4 +145,6 @@ def _normalize_product(sa: dict) -> dict:
         "image_urls": sa.get("image_urls", []),
         "feelings": sa.get("feelings", []),
         "terpenes": sa.get("terpenes", []),
+        # Preserve structured lab payload for downstream terp parsing in dispo_watch.
+        "lab_results": sa.get("lab_results", []),
     }

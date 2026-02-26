@@ -70,9 +70,11 @@ api:    POST https://api.dutchie.com/graphql  ← GraphQL, schema TBD
 This repo now includes an MCP server at [`mcp_server.py`](mcp_server.py) that exposes:
 
 - Local resources: project README, registry summary, full `data/stores.json`, and platform docs in `docs/`
+- Buddy agent resource: `pa://buddy/profile` for persona + safety + keystone-green alignment
 - Registry tools: list/search stores, get store by `registry_index`, platform capability metadata
 - Scraper tools: dispatch to the existing adapters (`trulieve`, `sunnyside`, `iheartjane`, `sweedpos`) using a store selected from the local registry
 - Dutchie recon helper: fetch Liberty embedded bootstrap JS (GraphQL menu scraping is still not cracked)
+- Buddy guidelines tool: `get_buddy_guidelines(mode?)` for structured persona/mode/safety/tooling rules
 
 ### Install
 
@@ -100,3 +102,52 @@ python mcp_server.py --transport streamable-http
 2. Call `get_store` to inspect required IDs/fields
 3. Call `scrape_store_menu` for the platform
 4. For SweedPOS, call `sweedpos_get_category_ids` first to get category IDs
+
+## Buddy Agent Profile (Prompt + Skill Scaffold)
+
+This repo includes a first-pass Buddy profile for a cannabis-savvy, stoner-friendly agent that is also technically aligned with the PA scraper workflow:
+
+- Prompt: [`prompts/buddy_system.md`](prompts/buddy_system.md)
+- Profile doc: [`docs/buddy-profile.md`](docs/buddy-profile.md)
+- Local agent skill (ignored by git in many setups): `.agents/skills/buddy-persona/SKILL.md`
+
+Buddy is designed to:
+- answer cannabis education/product questions (flower, carts, edibles, concentrates, extraction, terpenes, cannabinoids)
+- use harm-reduction framing and avoid medical claims
+- follow `keystone-green` scraping rules when asked to fetch live PA menu data
+
+## Daily Deal Watcher
+
+`dispo_watch.py` is a local CLI for scheduled PA dispensary price snapshots and a terminal deal digest.
+
+Features:
+- Scrapes supported stores (iHeartJane, Trulieve, Sunnyside/Cresco, SweedPOS; skips Liberty/Dutchie)
+- Normalizes product rows into a local SQLite database (`prices.db`)
+- Prints a Rich terminal digest of current deals and price drops
+- Supports filtering by:
+  - all stores
+  - explicit `registry_index` list
+  - radius around a ZIP code (with cached geocoding in `data/zip_cache.json`)
+
+Usage:
+
+```bash
+python dispo_watch.py            # scrape + digest
+python dispo_watch.py --digest   # digest only
+python dispo_watch.py --scrape   # scrape only
+python dispo_watch.py --list     # list stores matching current config
+```
+
+Config:
+- Optional local `watch_config.json` (ignored by git) for `all`, `stores`, or `radius` filter mode.
+- See inline example in `dispo_watch.py`.
+
+### 🧬 iHeartJane Hybrid Parsing
+The scraper uses a hybrid chain to maximize terpene coverage for iHeartJane stores:
+1. **Structured Lab Results (Priority):** If the store exposes raw lab data in the Algolia payload (`lab_results`), the watcher parses terpene compounds from that structured source.
+2. **Text Fallback (Optional):** If structured data is missing, the watcher can parse description text for explicit `Terpene: %` patterns.
+   - Enable in `watch_config.json`: `"iheartjane_text_fallback": true`
+
+Systemd user timer:
+- Templates included: [`dispo_watch.service`](dispo_watch.service), [`dispo_watch.timer`](dispo_watch.timer)
+- Default timer runs daily at `07:00` with randomized delay.
