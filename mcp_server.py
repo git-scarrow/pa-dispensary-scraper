@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +42,12 @@ SUPPORTED_DOCS = {
     "liberty-dutchie": DOCS_DIR / "liberty-dutchie.md",
 }
 
-mcp = FastMCP("PA Dispensary Scraper", json_response=True)
+mcp = FastMCP(
+    "PA Dispensary Scraper",
+    json_response=True,
+    host=os.environ.get("FASTMCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("FASTMCP_PORT", "8000")),
+)
 
 
 def _load_store_registry() -> dict[str, Any]:
