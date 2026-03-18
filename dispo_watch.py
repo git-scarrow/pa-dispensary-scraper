@@ -77,6 +77,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "aliases": {},
         "ignore_brands": [],
         "iheartjane_text_fallback": False,
+        "terp_ratio_only_categories": [],
+        "terp_ratio_min_thc_pct": None,
+        "terp_ratio_min_thc_by_category": {},
         "match_mode": "contains",
         "show_unicorn_summary": True,
         "show_ignored_summary": False,
@@ -100,6 +103,14 @@ EXAMPLE_CONFIG = """\
     },
     "ignore_brands": ["The Bank", "Seche", "Whole Plants", "Kind Tree"],
     "iheartjane_text_fallback": false,
+    "terp_ratio_only_categories": ["flower", "vape", "concentrate"],
+    "terp_ratio_min_thc_pct": 10,
+    "terp_ratio_min_thc_by_category": {
+      "flower": 10,
+      "vape": 40,
+      "cartridge": 40,
+      "concentrate": 40
+    },
     "match_mode": "contains",
     "show_unicorn_summary": true,
     "show_ignored_summary": true,
@@ -928,6 +939,35 @@ def _pct_style(pct: float | None) -> str:
     return "green"
 
 
+def _row_category_haystack(row: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("category", "subcategory"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            parts.append(value.casefold())
+    return " / ".join(parts)
+
+
+def _row_matches_category_needles(row: dict[str, Any], needles_cf: list[str]) -> bool:
+    if not needles_cf:
+        return True
+    hay = _row_category_haystack(row)
+    return any(needle in hay for needle in needles_cf)
+
+
+def _ratio_min_thc_floor_for_row(
+    row: dict[str, Any],
+    default_floor: float | None,
+    by_category: dict[str, float],
+) -> float | None:
+    if by_category:
+        hay = _row_category_haystack(row)
+        for needle_cf, floor in by_category.items():
+            if needle_cf in hay:
+                return floor
+    return default_floor
+
+
 def _notification_config(config: dict[str, Any]) -> dict[str, Any]:
     notifications = config.get("notifications") or {}
     unicorns = [str(x).strip() for x in notifications.get("unicorns", []) if str(x).strip()]
@@ -948,6 +988,45 @@ def _notification_config(config: dict[str, Any]) -> dict[str, Any]:
     else:
         log.warning("notifications.aliases should be an object; ignoring %r", type(aliases_raw).__name__)
     ignore_brands = [str(x).strip() for x in notifications.get("ignore_brands", []) if str(x).strip()]
+    ratio_only_categories_raw = notifications.get("terp_ratio_only_categories") or []
+    ratio_only_categories: list[str] = []
+    if isinstance(ratio_only_categories_raw, list):
+        ratio_only_categories = [
+            str(x).strip() for x in ratio_only_categories_raw if str(x).strip()
+        ]
+    elif isinstance(ratio_only_categories_raw, str) and ratio_only_categories_raw.strip():
+        ratio_only_categories = [ratio_only_categories_raw.strip()]
+    elif ratio_only_categories_raw not in ({}, None, []):
+        log.warning(
+            "notifications.terp_ratio_only_categories should be a list (or string); ignoring %r",
+            type(ratio_only_categories_raw).__name__,
+        )
+    ratio_min_thc_pct_raw = notifications.get("terp_ratio_min_thc_pct")
+    ratio_min_thc_pct = _coerce_percent_scalar(ratio_min_thc_pct_raw)
+    if ratio_min_thc_pct is not None and ratio_min_thc_pct < 0:
+        log.warning("Ignoring negative notifications.terp_ratio_min_thc_pct=%r", ratio_min_thc_pct_raw)
+        ratio_min_thc_pct = None
+    ratio_min_thc_by_category_raw = notifications.get("terp_ratio_min_thc_by_category") or {}
+    ratio_min_thc_by_category: dict[str, float] = {}
+    if isinstance(ratio_min_thc_by_category_raw, dict):
+        for raw_key, raw_val in ratio_min_thc_by_category_raw.items():
+            key = str(raw_key).strip().casefold()
+            if not key:
+                continue
+            parsed = _coerce_percent_scalar(raw_val)
+            if parsed is None or parsed < 0:
+                log.warning(
+                    "Ignoring invalid notifications.terp_ratio_min_thc_by_category[%r]=%r",
+                    raw_key,
+                    raw_val,
+                )
+                continue
+            ratio_min_thc_by_category[key] = parsed
+    else:
+        log.warning(
+            "notifications.terp_ratio_min_thc_by_category should be an object; ignoring %r",
+            type(ratio_min_thc_by_category_raw).__name__,
+        )
     match_mode = str(notifications.get("match_mode", "contains")).strip().lower()
     show_unicorn_summary = bool(notifications.get("show_unicorn_summary", True))
     show_ignored_summary = bool(notifications.get("show_ignored_summary", False))
@@ -1005,6 +1084,9 @@ def _notification_config(config: dict[str, Any]) -> dict[str, Any]:
         "unicorn_needles": unicorn_needles,
         "unicorn_canonical_by_needle_cf": unicorn_canonical_by_needle_cf,
         "ignore_brands": ignore_brands,
+        "terp_ratio_only_categories": [x.casefold() for x in ratio_only_categories],
+        "terp_ratio_min_thc_pct": ratio_min_thc_pct,
+        "terp_ratio_min_thc_by_category": ratio_min_thc_by_category,
         "match_mode": match_mode,
         "show_unicorn_summary": show_unicorn_summary,
         "show_ignored_summary": show_ignored_summary,
@@ -1198,6 +1280,9 @@ def render_digest(db: sqlite_utils.Database, config: dict[str, Any]) -> None:
     show_unicorn_summary = notif["show_unicorn_summary"]
     show_ignored_summary = notif["show_ignored_summary"]
     terp_thresholds = notif["terp_thresholds"]
+    ratio_only_categories = notif["terp_ratio_only_categories"]
+    ratio_min_thc_pct = notif["terp_ratio_min_thc_pct"]
+    ratio_min_thc_by_category = notif["terp_ratio_min_thc_by_category"]
     show_data_quality_audit = show_ignored_summary
 
     filtered_rows: list[dict[str, Any]] = []
@@ -1205,6 +1290,7 @@ def render_digest(db: sqlite_utils.Database, config: dict[str, Any]) -> None:
     terp_reject_count = 0
     terp_reject_missing_count = 0
     terp_reject_below_count = 0
+    terp_reject_guardrail_count = 0
     terp_reject_by_platform: dict[str, int] = {}
     unicorn_count = 0
     ignored_brand_summary: dict[str, dict[str, Any]] = {}
@@ -1238,6 +1324,24 @@ def render_digest(db: sqlite_utils.Database, config: dict[str, Any]) -> None:
             reject_reason = "below"
             for key, min_val in terp_thresholds.items():
                 if key == "terp_ratio":
+                    if ratio_only_categories and not _row_matches_category_needles(r, ratio_only_categories):
+                        reject = True
+                        reject_reason = "guardrail"
+                        break
+                    row_ratio_min_thc = _ratio_min_thc_floor_for_row(
+                        r,
+                        ratio_min_thc_pct,
+                        ratio_min_thc_by_category,
+                    )
+                    if row_ratio_min_thc is not None:
+                        if thc_pct is None:
+                            reject = True
+                            reject_reason = "missing"
+                            break
+                        if thc_pct < row_ratio_min_thc:
+                            reject = True
+                            reject_reason = "guardrail"
+                            break
                     if terp_ratio is None:
                         reject = True
                         reject_reason = "missing"
@@ -1260,8 +1364,10 @@ def render_digest(db: sqlite_utils.Database, config: dict[str, Any]) -> None:
                 terp_reject_count += 1
                 if reject_reason == "missing":
                     terp_reject_missing_count += 1
-                else:
+                elif reject_reason == "below":
                     terp_reject_below_count += 1
+                else:
+                    terp_reject_guardrail_count += 1
                 terp_reject_by_platform[platform_name] = terp_reject_by_platform.get(platform_name, 0) + 1
                 continue
 
@@ -1465,7 +1571,30 @@ def render_digest(db: sqlite_utils.Database, config: dict[str, Any]) -> None:
             else ""
         )
         + (
-            f"terp rejects missing={terp_reject_missing_count}, below={terp_reject_below_count}; "
+            "ratio guardrails: "
+            + ", ".join(
+                part for part in [
+                    (
+                        "cats="
+                        + "/".join(ratio_only_categories)
+                    ) if ratio_only_categories else "",
+                    (
+                        f"min_thc>={ratio_min_thc_pct:g}"
+                    ) if ratio_min_thc_pct is not None else "",
+                    (
+                        "cat_thc_overrides="
+                        + str(len(ratio_min_thc_by_category))
+                    ) if ratio_min_thc_by_category else "",
+                ] if part
+            )
+            + "; "
+            if terp_thresholds.get("terp_ratio") is not None and (
+                ratio_only_categories or ratio_min_thc_pct is not None or ratio_min_thc_by_category
+            )
+            else ""
+        )
+        + (
+            f"terp rejects missing={terp_reject_missing_count}, below={terp_reject_below_count}, guardrail={terp_reject_guardrail_count}; "
             if terp_reject_count
             else ""
         )
