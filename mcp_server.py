@@ -405,13 +405,14 @@ def scrape_store_menu(
             raise ValueError("`sweedpos_category_id` required for sweedpos. Call `sweedpos_get_category_ids` first.")
         if mode == "page":
             # Reuse internal helpers for one-page access to avoid fetching all pages.
-            return _safe_call(
-                lambda: sweedpos._extract_product_list(  # type: ignore[attr-defined]
+            def _sweedpos_page():
+                data = sweedpos._extract_product_list(  # type: ignore[attr-defined]
                     sweedpos._get_sw_qc(  # type: ignore[attr-defined]
                         store["domain"], store["base_path"], sweedpos_category_id, page
                     )
                 )
-            )
+                return {**data, "list": [sweedpos._normalize_product(p) for p in data.get("list", [])]}  # type: ignore[attr-defined]
+            return _safe_call(_sweedpos_page)
         return _safe_call(sweedpos.fetch_all_products, store["domain"], store["base_path"], sweedpos_category_id)
 
     if platform == "dutchie_embedded":

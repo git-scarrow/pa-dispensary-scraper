@@ -94,6 +94,54 @@ def get_category_ids(domain: str, base_path: str) -> dict[str, int]:
             return {c["name"]: c["id"] for c in cats}
     return {}
 
+def _normalize_product(p: dict) -> dict:
+    """Normalize a raw SweedPOS product to a standard shape.
+
+    THC/CBD are nested at variants[0].labTests.{thc,cbd}.value[0].
+    Price and promo info are also in variants[0].
+    """
+    variant = (p.get("variants") or [{}])[0]
+    lab = variant.get("labTests") or {}
+
+    thc_block = lab.get("thc") or lab.get("displayThc") or {}
+    thc_vals = thc_block.get("value") or []
+    percent_thc = thc_vals[0] if thc_vals else None
+
+    cbd_block = lab.get("cbd") or {}
+    cbd_vals = cbd_block.get("value") or []
+    percent_cbd = cbd_vals[0] if cbd_vals else None
+
+    price = variant.get("price")
+    promo_price = variant.get("promoPrice")
+    discounted_price = promo_price if promo_price and promo_price != price else None
+
+    promos = variant.get("promos") or []
+    special_title = promos[0].get("shortName", "") if promos else ""
+
+    brand = (p.get("brand") or {}).get("name")
+    strain = p.get("strain") or {}
+    strain_type = (strain.get("prevalence") or {}).get("name")
+    terpenes = [t["name"] for t in (strain.get("terpenes") or []) if t.get("name")]
+    product_type = (p.get("productType") or {}).get("name")
+
+    return {
+        "id": p.get("id"),
+        "name": p.get("name"),
+        "brand": brand,
+        "kind": "vape",
+        "kind_subtype": product_type,
+        "strain_type": strain_type,
+        "percent_thc": percent_thc,
+        "percent_cbd": percent_cbd,
+        "price": price,
+        "discounted_price": discounted_price,
+        "special_title": special_title,
+        "terpenes": terpenes,
+        "description": p.get("description"),
+        "image_urls": p.get("images") or [],
+    }
+
+
 def fetch_all_products(domain: str, base_path: str, category_id: int) -> list[dict]:
     products = []
     sw_qc = _get_sw_qc(domain, base_path, category_id, page=1)
@@ -105,4 +153,4 @@ def fetch_all_products(domain: str, base_path: str, category_id: int) -> list[di
         sw_qc = _get_sw_qc(domain, base_path, category_id, page)
         data = _extract_product_list(sw_qc)
         products.extend(data.get("list", []))
-    return products
+    return [_normalize_product(p) for p in products]
