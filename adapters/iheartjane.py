@@ -120,11 +120,10 @@ def _normalize_product(sa: dict) -> dict:
         or sa.get("price_half_gram")
         or sa.get("bucket_price")
     )
-    disc_price = (
-        sa.get("discounted_price_gram")
-        or sa.get("discounted_price_each")
-        or sa.get("discounted_price_half_gram")
-    )
+    # iHeartJane's discounted_price_* fields reflect a marketing "original price"
+    # reduced to the shelf price — the discount is already baked into price_*.
+    # Surfacing discounted_price_* as a real discount double-applies the promo.
+    # We keep special_title/special_amount as informational metadata only.
 
     return {
         "objectID": sa.get("objectID"),
@@ -138,7 +137,7 @@ def _normalize_product(sa: dict) -> dict:
         "percent_thc": sa.get("percent_thc"),
         "percent_cbd": sa.get("percent_cbd"),
         "price": price,
-        "discounted_price": disc_price if disc_price and disc_price != price else None,
+        "discounted_price": None,
         "special_title": sa.get("special_title") or "",
         "special_amount": sa.get("special_amount") or "",
         "description": sa.get("description"),

@@ -112,8 +112,8 @@ def _normalize_product(p: dict) -> dict:
     percent_cbd = cbd_vals[0] if cbd_vals else None
 
     price = variant.get("price")
-    promo_price = variant.get("promoPrice")
-    discounted_price = promo_price if promo_price and promo_price != price else None
+    # promoPrice is the shelf price re-derived from a marketing "original" —
+    # the discount is already baked into the displayed price.  Ignore it.
 
     promos = variant.get("promos") or []
     special_title = promos[0].get("shortName", "") if promos else ""
@@ -134,7 +134,7 @@ def _normalize_product(p: dict) -> dict:
         "percent_thc": percent_thc,
         "percent_cbd": percent_cbd,
         "price": price,
-        "discounted_price": discounted_price,
+        "discounted_price": None,
         "special_title": special_title,
         "terpenes": terpenes,
         "description": p.get("description"),

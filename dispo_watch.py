@@ -609,7 +609,7 @@ def _normalize_iheartjane(
         "category": product.get("kind") or "",
         "subcategory": product.get("kind_subtype") or "",
         "price": product.get("price"),
-        "discounted_price": product.get("discounted_price"),
+        "discounted_price": None,  # marketing theater — shelf price is the real price
         "special_title": product.get("special_title") or "",
         "thc_pct": product.get("percent_thc"),
         "_meta_source": source,
@@ -620,12 +620,8 @@ def _normalize_iheartjane(
 
 def _normalize_trulieve(product: dict, idx: int, store: dict, category: str) -> dict:
     base_price = product.get("med_unit_price") or product.get("unit_price")
-    sale_price = None
-    for v in product.get("variants") or []:
-        sp = v.get("sale_unit_price")
-        if sp and sp != base_price:
-            sale_price = sp
-            break
+    # sale_unit_price is the shelf price re-derived from a marketing "original" —
+    # the discount is already baked into the displayed price.  Ignore it.
     specials = product.get("specials") or []
     special_title = specials[0].get("title", "") if specials else ""
     thc = product.get("thc_content")
@@ -646,7 +642,7 @@ def _normalize_trulieve(product: dict, idx: int, store: dict, category: str) -> 
         "category": category,
         "subcategory": product.get("subcategory") or "",
         "price": float(base_price) if base_price else None,
-        "discounted_price": float(sale_price) if sale_price else None,
+        "discounted_price": None,
         "special_title": special_title,
         "thc_pct": thc_pct,
         "terp_names_present": 1 if trulieve_terps_list else 0,
@@ -662,7 +658,8 @@ def _normalize_cresco(product: dict, idx: int, store: dict, category: str) -> di
     brand = (sku_product.get("brand") or {}).get("name") or product.get("brand") or ""
     name = sku_product.get("name") or sku.get("name") or product.get("name") or ""
     base_price = product.get("price")
-    disc_price = product.get("discounted_price")
+    # discounted_price is the shelf price re-derived from a marketing "original" —
+    # the discount is already baked into the displayed price.  Ignore it.
     special = (product.get("applied_special") or {}).get("special_name") or ""
     potency = product.get("potency") or {}
     thc_raw = product.get("bt_potency_thc") or potency.get("thc")
@@ -691,7 +688,7 @@ def _normalize_cresco(product: dict, idx: int, store: dict, category: str) -> di
         "category": category,
         "subcategory": (sku_product.get("sub_category") or ""),
         "price": float(base_price) if base_price else None,
-        "discounted_price": float(disc_price) if disc_price and disc_price != base_price else None,
+        "discounted_price": None,
         "special_title": special,
         "thc_pct": float(thc_raw) if thc_raw else None,
         "terp_names_present": 1 if potency else 0,
@@ -710,7 +707,7 @@ def _normalize_sweedpos(product: dict, idx: int, store: dict, category_name: str
         vid = variant.get("id") or ""
         product_id = f"{base_id}:{vid}" if vid else base_id
         price = variant.get("price")
-        promo = variant.get("promoPrice")
+        # promoPrice is marketing theater — discount already in shelf price.
         promos = variant.get("promos") or []
         special_title = promos[0].get("shortName", "") if promos else ""
         lab = variant.get("labTests") or {}
@@ -748,7 +745,7 @@ def _normalize_sweedpos(product: dict, idx: int, store: dict, category_name: str
             "category": category_name,
             "subcategory": (product.get("subcategory") or {}).get("name") or "",
             "price": float(price) if price is not None else None,
-            "discounted_price": float(promo) if promo and promo != price else None,
+            "discounted_price": None,
             "special_title": special_title,
             "thc_pct": thc_pct,
             "terp_names_present": terp_names_present,
