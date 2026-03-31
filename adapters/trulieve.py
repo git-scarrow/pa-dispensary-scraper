@@ -18,7 +18,10 @@ def fetch_all_products(store_id: int, category: str) -> list[dict]:
     page = 1
     while True:
         data = fetch_menu(store_id, category, page)
-        products.extend(data.get("products", []))
+        items = data.get("data")
+        if not isinstance(items, list):
+            items = data.get("products", [])
+        products.extend(items)
         if page >= data.get("last_page", 1):
             break
         page += 1
