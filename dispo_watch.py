@@ -342,6 +342,22 @@ def _extract_unit_size_g(*values: Any) -> float | None:
     return None
 
 
+def _price_per_g(price: float | None, unit_size_g: float | None) -> float | None:
+    if price is None or unit_size_g is None or unit_size_g <= 0:
+        return None
+    return round(float(price) / float(unit_size_g), 2)
+
+
+def _attach_unit_pricing(row: dict[str, Any]) -> dict[str, Any]:
+    unit_size_g = _coerce_percent_scalar(row.get("unit_size_g"))
+    price = _coerce_percent_scalar(row.get("price"))
+    discounted_price = _coerce_percent_scalar(row.get("discounted_price"))
+    row["unit_size_g"] = unit_size_g
+    row["unit_price_g"] = _price_per_g(price, unit_size_g)
+    row["discounted_unit_price_g"] = _price_per_g(discounted_price, unit_size_g)
+    return row
+
+
 def _normalize_terp_key(key: Any) -> str:
     text = str(key or "").strip().casefold()
     if not text:
@@ -666,7 +682,7 @@ def _normalize_iheartjane(
         "_meta_source": source,
     }
     row.update(terps)
-    return row
+    return _attach_unit_pricing(row)
 
 
 def _normalize_trulieve(product: dict, idx: int, store: dict, category: str) -> dict:
@@ -718,7 +734,7 @@ def _normalize_trulieve(product: dict, idx: int, store: dict, category: str) -> 
         "_meta_source": "trulieve_nested",
     }
     row.update(terps)
-    return row
+    return _attach_unit_pricing(row)
 
 
 def _normalize_cresco(product: dict, idx: int, store: dict, category: str) -> dict:
@@ -773,7 +789,7 @@ def _normalize_cresco(product: dict, idx: int, store: dict, category: str) -> di
         "_meta_source": "cresco_api",
     }
     row.update(terps)
-    return row
+    return _attach_unit_pricing(row)
 
 
 def _normalize_sweedpos(product: dict, idx: int, store: dict, category_name: str) -> list[dict]:
@@ -853,7 +869,7 @@ def _normalize_sweedpos(product: dict, idx: int, store: dict, category_name: str
             "_meta_source": "sweed_labtests" if flat_terps else ("sweed_strain_names" if strain_terps_names else "none"),
         }
         row.update(terps)
-        rows.append(row)
+        rows.append(_attach_unit_pricing(row))
     return rows
 
 
@@ -1035,6 +1051,24 @@ def _pct_style(pct: float | None) -> str:
     if pct >= 25:
         return "bold yellow"
     return "green"
+
+
+def _value_sort_key(item: dict[str, Any]) -> tuple[float, float, float]:
+    row = item["row"]
+    discounted_unit_price_g = _coerce_percent_scalar(row.get("discounted_unit_price_g"))
+    unit_price_g = _coerce_percent_scalar(row.get("unit_price_g"))
+    effective_unit_price_g = (
+        discounted_unit_price_g
+        if discounted_unit_price_g is not None
+        else unit_price_g
+    )
+    terp_total = _coerce_percent_scalar(item.get("terp_total"))
+    thc_pct = _coerce_percent_scalar(row.get("thc_pct"))
+    return (
+        effective_unit_price_g if effective_unit_price_g is not None else float("inf"),
+        -(terp_total if terp_total is not None else -1.0),
+        -(thc_pct if thc_pct is not None else -1.0),
+    )
 
 
 def _row_category_haystack(row: dict[str, Any]) -> str:
@@ -1530,6 +1564,7 @@ def render_digest(db: sqlite_utils.Database, config: dict[str, Any]) -> None:
             _render_data_quality_audit(db, selected_indices)
         return
 
+    filtered_rows.sort(key=_value_sort_key)
     final_rows = filtered_rows[:DIGEST_RENDER_LIMIT]
 
     title_extra = f" — {unicorn_count} 🦄 Found" if unicorn_count else ""
@@ -1542,6 +1577,7 @@ def render_digest(db: sqlite_utils.Database, config: dict[str, Any]) -> None:
     table.add_column("Brand", style="dim")
     table.add_column("Subcat.", style="dim", no_wrap=True)
     table.add_column("Size", justify="right", style="dim", no_wrap=True)
+    table.add_column("$/g", justify="right", style="dim", no_wrap=True)
     table.add_column("THC%", justify="right", style="dim")
     table.add_column("Terps", justify="right", style="bold yellow", no_wrap=True)
     table.add_column("Was", justify="right", style="dim red")
@@ -1562,6 +1598,7 @@ def render_digest(db: sqlite_utils.Database, config: dict[str, Any]) -> None:
         size_label = str(r.get("unit_size_label") or "")
         price = _coerce_percent_scalar(r.get("price"))
         disc = _coerce_percent_scalar(r.get("discounted_price"))
+        unit_price_g = _coerce_percent_scalar(r.get("discounted_unit_price_g")) or _coerce_percent_scalar(r.get("unit_price_g"))
         special = r.get("special_title")
         thc = _coerce_percent_scalar(r.get("thc_pct"))
         pct = _pct_off(price, disc)
@@ -1586,6 +1623,7 @@ def render_digest(db: sqlite_utils.Database, config: dict[str, Any]) -> None:
             (brand or "")[:18],
             (subcat or cat or "")[:14],
             size_label or "—",
+            f"${unit_price_g:.2f}" if unit_price_g else "—",
             f"{thc:.1f}%" if thc else "—",
             terp_cell,
             f"${price:.2f}" if price else "—",
