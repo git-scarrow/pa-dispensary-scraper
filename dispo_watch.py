@@ -699,11 +699,23 @@ def _normalize_cresco(product: dict, idx: int, store: dict, category: str) -> di
 
 
 def _normalize_sweedpos(product: dict, idx: int, store: dict, category_name: str) -> list[dict]:
-    brand = (product.get("brand") or {}).get("name") or ""
+    brand_field = product.get("brand")
+    if isinstance(brand_field, dict):
+        brand = brand_field.get("name") or ""
+    elif isinstance(brand_field, str):
+        brand = brand_field
+    else:
+        brand = ""
     name = product.get("name") or ""
     base_id = str(product.get("id") or "")
     rows = []
-    for variant in product.get("variants") or [{}]:
+    variants = product.get("variants")
+    if isinstance(variants, dict):
+        variants = list(variants.values())
+    if not isinstance(variants, list):
+        variants = [{}]
+    dict_variants = [variant for variant in variants if isinstance(variant, dict)] or [{}]
+    for variant in dict_variants:
         vid = variant.get("id") or ""
         product_id = f"{base_id}:{vid}" if vid else base_id
         price = variant.get("price")
@@ -723,7 +735,8 @@ def _normalize_sweedpos(product: dict, idx: int, store: dict, category_name: str
             or lab
         )
         flat_terps = _flatten_terp_source(terp_source)
-        strain_terps_names = _flatten_terp_source((product.get("strain") or {}).get("terpenes"))
+        strain = product.get("strain") if isinstance(product.get("strain"), dict) else {}
+        strain_terps_names = _flatten_terp_source(strain.get("terpenes"))
         terp_names_present = 1 if (flat_terps or strain_terps_names) else 0
 
         terps = _extract_terps(flat_terps, {})
@@ -734,6 +747,13 @@ def _normalize_sweedpos(product: dict, idx: int, store: dict, category_name: str
             }
         )
         vname = variant.get("name") or ""
+        subcategory = product.get("subcategory")
+        if isinstance(subcategory, dict):
+            subcategory_name = subcategory.get("name") or ""
+        elif isinstance(subcategory, str):
+            subcategory_name = subcategory
+        else:
+            subcategory_name = ""
         row = {
             "registry_index": idx,
             "operator": store["operator"],
@@ -743,7 +763,7 @@ def _normalize_sweedpos(product: dict, idx: int, store: dict, category_name: str
             "name": f"{name} — {vname}" if vname else name,
             "brand": brand,
             "category": category_name,
-            "subcategory": (product.get("subcategory") or {}).get("name") or "",
+            "subcategory": subcategory_name,
             "price": float(price) if price is not None else None,
             "discounted_price": None,
             "special_title": special_title,

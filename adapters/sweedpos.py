@@ -85,6 +85,25 @@ def _extract_product_list(sw_qc: dict) -> dict:
             return val.get("state", {}).get("data", {})
     raise ValueError("/Products/GetProductList not found in __sw_qc")
 
+
+def _variant_dicts(product: dict) -> list[dict]:
+    """Return only dict-shaped variants from a product payload."""
+    variants = product.get("variants")
+    if isinstance(variants, dict):
+        variants = list(variants.values())
+    if not isinstance(variants, list):
+        return [{}]
+    dict_variants = [v for v in variants if isinstance(v, dict)]
+    return dict_variants or [{}]
+
+
+def _name_field(value) -> str:
+    if isinstance(value, dict):
+        return value.get("name") or ""
+    if isinstance(value, str):
+        return value
+    return ""
+
 def get_category_ids(domain: str, base_path: str) -> dict[str, int]:
     """Return {category_name: id} from SSR cache."""
     sw_qc = _get_sw_qc(domain, base_path, category_id=0)  # load page without filter
@@ -100,7 +119,7 @@ def _normalize_product(p: dict) -> dict:
     THC/CBD are nested at variants[0].labTests.{thc,cbd}.value[0].
     Price and promo info are also in variants[0].
     """
-    variant = (p.get("variants") or [{}])[0]
+    variant = _variant_dicts(p)[0]
     lab = variant.get("labTests") or {}
 
     thc_block = lab.get("thc") or lab.get("displayThc") or {}
@@ -118,11 +137,12 @@ def _normalize_product(p: dict) -> dict:
     promos = variant.get("promos") or []
     special_title = promos[0].get("shortName", "") if promos else ""
 
-    brand = (p.get("brand") or {}).get("name")
-    strain = p.get("strain") or {}
-    strain_type = (strain.get("prevalence") or {}).get("name")
-    terpenes = [t["name"] for t in (strain.get("terpenes") or []) if t.get("name")]
-    product_type = (p.get("productType") or {}).get("name")
+    brand = _name_field(p.get("brand"))
+    strain = p.get("strain") if isinstance(p.get("strain"), dict) else {}
+    prevalence = strain.get("prevalence")
+    strain_type = _name_field(prevalence)
+    terpenes = [t["name"] for t in (strain.get("terpenes") or []) if isinstance(t, dict) and t.get("name")]
+    product_type = _name_field(p.get("productType"))
 
     return {
         "id": p.get("id"),
