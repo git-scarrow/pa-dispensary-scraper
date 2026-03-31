@@ -623,7 +623,14 @@ def _normalize_trulieve(product: dict, idx: int, store: dict, category: str) -> 
     # sale_unit_price is the shelf price re-derived from a marketing "original" —
     # the discount is already baked into the displayed price.  Ignore it.
     specials = product.get("specials") or []
-    special_title = specials[0].get("title", "") if specials else ""
+    special_title = ""
+    if specials and isinstance(specials[0], dict):
+        special_title = (
+            specials[0].get("title")
+            or specials[0].get("name")
+            or ((specials[0].get("menu_display_configuration") or {}).get("name"))
+            or ""
+        )
     thc = product.get("thc_content")
     thc_pct = float(thc) if thc and product.get("thc_content_unit") == "%" else None
     trulieve_terps_list = product.get("terpenes") or []
