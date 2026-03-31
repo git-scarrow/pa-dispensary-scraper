@@ -120,6 +120,14 @@ def _normalize_product(sa: dict) -> dict:
         or sa.get("price_half_gram")
         or sa.get("bucket_price")
     )
+    unit_size_g = None
+    unit_size_label = ""
+    if sa.get("price_half_gram") is not None:
+        unit_size_g = 0.5
+        unit_size_label = "0.5g"
+    elif sa.get("price_gram") is not None:
+        unit_size_g = 1.0
+        unit_size_label = "1g"
     # iHeartJane's discounted_price_* fields reflect a marketing "original price"
     # reduced to the shelf price — the discount is already baked into price_*.
     # Surfacing discounted_price_* as a real discount double-applies the promo.
@@ -138,6 +146,8 @@ def _normalize_product(sa: dict) -> dict:
         "percent_cbd": sa.get("percent_cbd"),
         "price": price,
         "discounted_price": None,
+        "unit_size_g": unit_size_g,
+        "unit_size_label": unit_size_label,
         "special_title": sa.get("special_title") or "",
         "special_amount": sa.get("special_amount") or "",
         "description": sa.get("description"),
