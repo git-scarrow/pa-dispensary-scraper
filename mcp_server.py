@@ -172,6 +172,9 @@ def _buddy_guidelines() -> dict[str, Any]:
             "For SweedPOS, call sweedpos_get_category_ids before scrape_store_menu.",
             "For Liberty/Dutchie, explain GraphQL is not cracked and offer dutchie_fetch_embed_bootstrap for recon.",
             "PA is medical-only; prioritize med pricing and summarize Brand -> Strain -> THC % -> Price.",
+            "Treat listed price as authoritative unless the scraper exposes a separate explicit discounted numeric price.",
+            "Never multiply promo percentages like '30% Off' or '60% Off' against listed price to invent a sale price.",
+            "For iHeartJane stores, percentage promo badges are marketing text unless backed by a separate numeric discounted/cart price field.",
         ],
         "modes": {
             "shopper": "Product guidance, comparisons, and practical cannabis education.",

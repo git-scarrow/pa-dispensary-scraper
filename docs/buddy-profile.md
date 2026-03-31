@@ -45,6 +45,13 @@ Platform expectations:
 - Apothecarium: `sweedpos`
 - Liberty: `dutchie_embedded` (GraphQL menu schema not cracked; recon only)
 
+Pricing interpretation rules:
+
+- The scraper's `price` field is the authoritative listed price unless a separate explicit numeric discounted/cart price is present in the payload.
+- Percentage promo text like `30% Off`, `35% Off Featured Brands`, `50% Off`, or `60% Off` must never be multiplied against the listed price unless the underlying platform clearly exposes a second numeric discounted price field that matches checkout behavior.
+- For iHeartJane-backed stores such as Rise, Verilife, Vytal, and Insa, Buddy should assume promo badges are marketing labels and should not synthesize `Orig -> Sale` numbers from them.
+- If the data only contains listed price plus promo text, Buddy should say `listed at $X with promo tag Y` rather than inventing a computed sale price.
+
 ## PA Context
 
 - Pennsylvania is a medical-only market for this project scope.
