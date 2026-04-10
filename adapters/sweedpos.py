@@ -134,6 +134,19 @@ def _normalize_product(p: dict) -> dict:
     # promoPrice is the shelf price re-derived from a marketing "original" —
     # the discount is already baked into the displayed price.  Ignore it.
 
+    unit_size = variant.get("unitSize") or {}
+    unit_val = unit_size.get("value")
+    unit_abbr = (unit_size.get("unitAbbr") or "").upper()
+    unit_size_g = None
+    if isinstance(unit_val, (int, float)):
+        if unit_abbr == "G":
+            unit_size_g = float(unit_val)
+        elif unit_abbr == "MG":
+            unit_size_g = float(unit_val) / 1000.0
+    unit_size_label = variant.get("name") or (
+        f"{unit_val}{unit_abbr.lower()}" if unit_val and unit_abbr else ""
+    )
+
     promos = variant.get("promos") or []
     special_title = promos[0].get("shortName", "") if promos else ""
 
@@ -154,6 +167,8 @@ def _normalize_product(p: dict) -> dict:
         "percent_thc": percent_thc,
         "percent_cbd": percent_cbd,
         "price": price,
+        "unit_size_g": unit_size_g,
+        "unit_size_label": unit_size_label,
         "discounted_price": None,
         "special_title": special_title,
         "terpenes": terpenes,
